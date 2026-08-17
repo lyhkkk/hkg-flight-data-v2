@@ -6,6 +6,7 @@ HKG Flight Data — 远程实时查询系统
 import json
 import os
 import sys
+import time
 import urllib.request
 from datetime import date, timedelta
 
@@ -35,7 +36,7 @@ def fetch_flights(dt, flight_type=""):
 
     # 检查缓存
     if os.path.exists(cache_file):
-        age = os.time.time() - os.path.getmtime(cache_file)
+        age = time.time() - os.path.getmtime(cache_file)
         if age < CACHE_EXPIRY:
             with open(cache_file, 'r', encoding='utf-8') as f:
                 return json.load(f)
@@ -95,7 +96,8 @@ def parse_flights(raw_data):
                 'gate': flight.get('gate', ''),
                 'aisle': flight.get('aisle', ''),
                 'hall': flight.get('hall', ''),
-                'belt': flight.get('belt', ''),
+                'belt': flight.get('baggage', '') or flight.get('belt', ''),
+                'parking_stand': flight.get('stand', ''),
             }
 
             if entry.get('arrival'):
@@ -273,18 +275,23 @@ def run_cli():
             return
 
         for f in results:
-            tp = '→' if f.get('type') == 'departure' else '←'
+            tp = '->' if f.get('type') == 'departure' else '<-'
             dest = f.get('destination', f.get('origin', ''))
             print(f"\n{'='*40}")
             print(f"  {f['flight_number']}  |  {f['type'].upper()}")
             print(f"  Route:  HKG {tp} {dest}")
             print(f"  Date:   {f['date']}  {f['time']}")
             print(f"  Status: {f.get('status', 'Scheduled')}")
-            print(f"  Terminal: {f.get('terminal', '-')}")
-            print(f"  Gate:     {f.get('gate', '-')}")
-            print(f"  Aisle:    {f.get('aisle', '-')}")
-            print(f"  Hall:     {f.get('hall', '-')}")
-            print(f"  Belt:     {f.get('belt', '-')}")
+            if f.get('type') == 'arrival':
+                print(f"  Terminal: {f.get('terminal', '-')}")
+                print(f"  Stand:    {f.get('parking_stand', f.get('gate', '-'))}")
+                print(f"  Hall:     {f.get('hall', '-')}")
+                print(f"  Belt:     {f.get('belt', '-')}")
+            else:
+                print(f"  Terminal: {f.get('terminal', '-')}")
+                print(f"  Gate:     {f.get('gate', '-')}")
+                print(f"  Aisle:    {f.get('aisle', '-')}")
+                print(f"  Hall:     {f.get('hall', '-')}")
         print(f"\n{'='*40}")
         print(f"Total: {len(results)} results")
 
