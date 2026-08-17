@@ -30,6 +30,8 @@ def fetch_flight_stats(carrier, flight_num, year, month, date):
             if match:
                 data = json.loads(match.group(1))
                 flight = data.get('props', {}).get('initialState', {}).get('flightTracker', {}).get('flight', {})
+                if not flight:
+                    return {'tailNumber': '', 'callsign': '', 'equipment': '', 'notFound': True}
                 positional = flight.get('positional', {}).get('flexTrack', {})
                 return {
                     'tailNumber': positional.get('tailNumber', ''),
@@ -83,7 +85,7 @@ def lookup_reg(carrier, num, date):
     # Try fetching if not cached
     year, month, day = date.split('-')
     result = fetch_flight_stats(carrier, num, year, month, int(day))
-    if 'error' not in result and result.get('tailNumber'):
+    if 'error' not in result:
         save_cache(carrier, num, date, result)
     return result
 
