@@ -66,8 +66,7 @@ class FlightDB:
         """返回组合航司代码，如 CPA/CX"""
         info = self.airlines.get(code, {})
         iata = info.get('iata_code', '')
-        # Only show IATA code if it's a proper 2-letter code
-        if iata and len(iata) == 2 and iata != code:
+        if iata and iata != code:
             return f"{code}/{iata}"
         return code
 

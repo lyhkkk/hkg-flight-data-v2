@@ -87,8 +87,7 @@ def airline_display(code):
                 for a in json.load(f):
                     if a.get('airline_code') == code:
                         iata = a.get('iata_code', '')
-                        # Only show IATA code if it's a proper 2-letter code
-                        if iata and len(iata) == 2 and iata != code:
+                        if iata and iata != code:
                             return f"{code}/{iata}"
                         return code
     except Exception:
