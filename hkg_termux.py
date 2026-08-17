@@ -6,8 +6,10 @@ Termux 航班数据查询系统
 
 import json
 import os
+import re
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
+
 
 # ========== 数据库 ==========
 class FlightDB:
@@ -57,6 +59,89 @@ class FlightDB:
         if flight_type in ('all', 'departure'):
             results += [f for f in self.departures if f.get('date') == date]
         return results
+
+    def search_by_stand_or_gate(self, query, hours_before=12, hours_after=2):
+        """Search by parking stand (arrivals) or gate (departures) within time window.
+        Query examples: 'N32' for stand, '32' for gate.
+        Returns flights where: now - hours_before <= scheduled_time <= now + hours_after
+        """
+        now = datetime.now()
+        window_start = now - timedelta(hours=hours_before)
+        window_end = now + timedelta(hours=hours_after)
+
+        q = query.upper().strip()
+        results = []
+
+        # Parse gate number from query (e.g., '32' or 'G32')
+        gate_match = re.match(r'^(?:G)?(\d+)$', q)
+        gate_num = gate_match.group(1) if gate_match else None
+
+        # Search arrivals by parking_stand
+        for f in self.arrivals:
+            stand = f.get('parking_stand', '').upper()
+            if stand == q or (q.isdigit() and stand.endswith(q)):
+                try:
+                    dt = datetime.strptime(f"{f['date']} {f['time']}", '%Y-%m-%d %H:%M')
+                    if window_start <= dt <= window_end:
+                        results.append(f)
+                except Exception:
+                    pass
+
+        # Search departures by gate
+        if gate_num:
+            for f in self.departures:
+                gate = f.get('gate', '')
+                if gate == gate_num:
+                    try:
+                        dt = datetime.strptime(f"{f['date']} {f['time']}", '%Y-%m-%d %H:%M')
+                        if window_start <= dt <= window_end:
+                            results.append(f)
+                    except Exception:
+                        pass
+
+        return results
+
+    def search_flight_number_contains(self, num_str, codeshare=False, limit=30):
+        """Search flights where flight number contains the given string.
+        If codeshare=False, only return primary flight numbers.
+        If codeshare=True, also match against all_flight_numbers.
+        """
+        results = []
+        q = num_str.upper().strip()
+        all_flights = self.arrivals + self.departures
+
+        for f in all_flights:
+            if len(results) >= limit:
+                break
+            fn = f.get('flight_number', '').upper().replace(' ', '')
+            if q in fn:
+                results.append(f)
+                continue
+            if codeshare:
+                all_fn = f.get('all_flight_numbers', '').upper().replace(' ', '')
+                if q in all_fn:
+                    results.append(f)
+
+        return results
+
+    def get_reg(self, flight_number, date):
+        """Look up aircraft registration from FlightStats cache."""
+        fn = flight_number.replace(' ', '').strip()
+        match = re.match(r'([A-Za-z]+)(\d+)', fn)
+        if not match:
+            return None
+        carrier = match.group(1).upper()
+        num = match.group(2)
+        cache_dir = os.path.expanduser('~/.hkg_cache/flightstats')
+        path = os.path.join(cache_dir, f'{carrier}_{num}_{date}.json')
+        if os.path.exists(path):
+            try:
+                with open(path, 'r') as f:
+                    data = json.load(f)
+                    return data.get('tailNumber', '') or None
+            except Exception:
+                pass
+        return None
 
     def get_airline(self, code):
         """获取航空公司信息"""
@@ -116,6 +201,17 @@ def run_web_server(data_dir='.', port=8080):
                 date = params.get('date', [''])[0]
                 results = db.search_by_date(date)
                 self.wfile.write(json.dumps(results, ensure_ascii=False).encode('utf-8'))
+            elif self.path.startswith('/api/reg'):
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json; charset=utf-8')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                from urllib.parse import urlparse, parse_qs
+                params = parse_qs(urlparse(self.path).query)
+                fn = params.get('flight', [''])[0]
+                date = params.get('date', [''])[0]
+                reg = db.get_reg(fn, date)
+                self.wfile.write(json.dumps({'reg': reg or ''}, ensure_ascii=False).encode('utf-8'))
             elif self.path == '/api/stats':
                 self.send_response(200)
                 self.send_header('Content-type', 'application/json; charset=utf-8')
@@ -169,6 +265,7 @@ h1{{text-align:center;color:#faa718;margin:16px 0;font-size:22px}}
 .flight-card .route{{font-size:16px;margin:8px 0}}
 .flight-card .status{{color:#4ade80;font-weight:600}}
 .flight-card .detail{{font-size:12px;color:#8fa4c4;margin-top:8px;line-height:1.8}}
+.flight-card .reg{{color:#faa718;font-weight:600}}
 </style>
 </head>
 <body>
@@ -198,15 +295,24 @@ async function search(){{
   el.innerHTML=data.map(f=>`
     <div class="flight-card">
       <div class="fn">${{f.flight_number}}</div>
-      <div class="route">${{f.type==='arrival'?f.origin+' → HKG':'HKG → '+f.destination}}</div>
+      <div class="route">${{f.type==='arrival'?f.origin+' \\u2192 HKG':'HKG \\u2192 '+f.destination}}</div>
       <div class="status">${{f.status||'Scheduled'}}</div>
       <div class="detail">
         Date: ${{f.date}} | Time: ${{f.time}} | Terminal: ${{f.airline_terminal||f.terminal||'-'}}<br>
         ${{f.gate?'Gate: '+f.gate+' | ':''}}${{f.check_in_aisle?'Check-in: '+f.check_in_aisle:''}}<br>
-        Airline: ${{f.airline_name||f.airline_code}} | Transfer: ${{f.transfer_desk||'N/A'}}
+        Airline: ${{f.airline_name||f.airline_code}} | Transfer: ${{f.transfer_desk||'N/A'}}<br>
+        Reg: <span class="reg" data-flight="${{f.flight_number}}" data-date="${{f.date}}">...</span>
       </div>
     </div>
   `).join('');
+  // Fetch reg numbers
+  document.querySelectorAll('.reg').forEach(async el => {{
+    try {{
+      const res = await fetch(`/api/reg?flight=${{encodeURIComponent(el.dataset.flight)}}&date=${{el.dataset.date}}`);
+      const d = await res.json();
+      el.textContent = d.reg || '-';
+    }} catch(e) {{ el.textContent = '-'; }}
+  }});
 }}
 </script>
 </body>
@@ -229,7 +335,7 @@ def run_tui(data_dir='.'):
         print(f"  Airlines: {stats['airlines']}")
         print(f"  Date Range: {stats['date_range']}")
         print("-" * 50)
-        print("  1. Search by flight number")
+        print("  1. Search by stand/gate or flight number")
         print("  2. Search by date")
         print("  3. Show airline info")
         print("  4. Start web server (browser)")
@@ -239,23 +345,50 @@ def run_tui(data_dir='.'):
         choice = input("  Choose: ").strip()
 
         if choice == '1':
-            fn = input("  Flight number: ").strip()
-            if fn:
-                results = db.search_flight(fn)
-                if results:
-                    for r in results:
-                        airline_disp = db.airline_display(r.get('airline_code', ''))
-                        print(f"\n  {r['flight_number']} ({airline_disp}) | {r['date']} {r['time']}")
-                        tp = '→' if 'destination' in r else '←'
-                        dest = r.get('destination', r.get('origin', ''))
-                        print(f"  Route: HKG {tp} {dest}")
-                        print(f"  Status: {r.get('status', 'Scheduled')}")
-                        print(f"  Terminal: {r.get('airline_terminal', r.get('terminal', '-'))}")
-                        print(f"  Gate: {r.get('gate', '-')}")
-                        print(f"  Check-in: {r.get('check_in_aisle', '-')}")
-                        print(f"  Transfer Desk: {r.get('transfer_desk', 'N/A')}")
-                else:
-                    print("  No results found.")
+            print("\n  Search for stand/gate or flight number?")
+            print("  1. Stand / Gate")
+            print("  2. Flight number")
+            sub = input("  Choose (1/2): ").strip()
+
+            if sub == '1':
+                query = input("  Stand or Gate (e.g. N32 or 32): ").strip().upper()
+                if query:
+                    results = db.search_by_stand_or_gate(query)
+                    if results:
+                        results.sort(key=lambda x: (x.get('date', ''), x.get('time', '')))
+                        print(f"\n  Found {len(results)} flights for stand/gate '{query}':")
+                        print(f"  {'Type':5s} {'Flight':10s} {'Reg':8s} {'Date':12s} {'Time':6s} {'Route':20s} {'Status':20s} {'Stand/Gate'}")
+                        print("  " + "-" * 100)
+                        for r in results:
+                            tp = 'ARR' if 'origin' in r else 'DEP'
+                            dest = r.get('destination', r.get('origin', ''))
+                            route = f"HKG→{dest}" if tp == 'DEP' else f"{dest}→HKG"
+                            stand_info = r.get('parking_stand', '') or r.get('gate', '')
+                            reg = db.get_reg(r['flight_number'], r['date']) or '-'
+                            print(f"  {tp:5s} {r['flight_number']:10s} {reg:8s} {r['date']:12s} {r['time']:6s} {route:20s} {r.get('status', ''):20s} {stand_info}")
+                    else:
+                        print(f"  No flights found for stand/gate '{query}'.")
+
+            elif sub == '2':
+                fn = input("  Flight number (e.g. CX759): ").strip()
+                if fn:
+                    cs = input("  Include codeshare? (y/n) [n]: ").strip().lower()
+                    codeshare = cs in ('y', 'yes')
+                    results = db.search_flight_number_contains(fn, codeshare=codeshare)
+                    if results:
+                        results.sort(key=lambda x: (x.get('date', ''), x.get('time', '')))
+                        print(f"\n  Found {len(results)} flights containing '{fn}':")
+                        print(f"  {'Type':5s} {'Flight':10s} {'Reg':8s} {'Date':12s} {'Time':6s} {'Route':20s} {'Status':20s}")
+                        print("  " + "-" * 90)
+                        for r in results:
+                            tp = 'ARR' if 'origin' in r else 'DEP'
+                            dest = r.get('destination', r.get('origin', ''))
+                            route = f"HKG→{dest}" if tp == 'DEP' else f"{dest}→HKG"
+                            reg = db.get_reg(r['flight_number'], r['date']) or '-'
+                            print(f"  {tp:5s} {r['flight_number']:10s} {reg:8s} {r['date']:12s} {r['time']:6s} {route:20s} {r.get('status', ''):20s}")
+                    else:
+                        print(f"  No flights found containing '{fn}'.")
+
             input("\n  Press Enter...")
 
         elif choice == '2':
