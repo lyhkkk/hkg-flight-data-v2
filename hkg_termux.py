@@ -75,7 +75,7 @@ class FlightDB:
         """Search arrivals by parking_stand (e.g. N32) or departures by gate (e.g. 32).
         Time window: 12h before to 2h after now.
         """
-        q = query.upper().strip()
+        q = query.upper().replace(' ', '').strip()
         gate_match = re.match(r'^(?:G)?(\d+)$', q)
         gate_num = gate_match.group(1) if gate_match else None
         results = []
@@ -102,7 +102,7 @@ class FlightDB:
         If codeshare=False: only operator airline (primary flight_number).
         If codeshare=True: also match all_flight_numbers.
         """
-        q = num_str.upper().strip()
+        q = num_str.upper().replace(' ', '').strip()
         results = []
 
         for f in self.arrivals + self.departures:
@@ -311,19 +311,149 @@ async function search(){{
 </html>'''
 
 
+# ========== 手动刷新航班数据 ==========
+def run_refresh(db, data_dir='.'):
+    """Fetch flight data for yesterday & today from HKIA and refresh the in-memory FlightDB.
+
+    Reuses the project's own fetch/format/merge helpers in scripts/.
+    Refetches BOTH yesterday and today so that flights still inside the
+    12h-before ~ +2h-after search window (e.g. yesterday's flights after
+    midnight) get their statuses updated too.  Merges in place for those
+    two dates only; all other days are preserved.  Yesterday uses the
+    'flights/past' endpoint, today uses the regular 'flights' endpoint.
+    Returns (arrivals_count, departures_count) or None on failure.
+    """
+    import sys
+
+    scripts_dir = os.path.join(data_dir, 'scripts')
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+
+    try:
+        import fetch_flights as ff
+        import merge_airline_data as md
+    except Exception as e:
+        print(f"  ✗ Could not load refresh helpers: {e}")
+        return None
+
+    # Load airline lookup once (runs from data_dir so relative path resolves)
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(data_dir)
+        _, airline_lookup = md.load_airline_info()
+    finally:
+        os.chdir(old_cwd)
+
+    arr_path = os.path.join(data_dir, 'hkg_arrivals_enriched.json')
+    dep_path = os.path.join(data_dir, 'hkg_departures_enriched.json')
+    existing_arr, existing_dep = [], []
+    if os.path.exists(arr_path):
+        with open(arr_path, 'r', encoding='utf-8') as f:
+            existing_arr = json.load(f)
+    if os.path.exists(dep_path):
+        with open(dep_path, 'r', encoding='utf-8') as f:
+            existing_dep = json.load(f)
+
+    today = datetime.now().date()
+    today_str = today.strftime('%Y-%m-%d')
+    yesterday_str = (today - timedelta(days=1)).strftime('%Y-%m-%d')
+
+    fresh_arr, fresh_dep = 0, 0
+    # Yesterday -> 'flights/past' endpoint, today -> regular 'flights' endpoint
+    for date_obj, date_str, endpoint in (
+        (today - timedelta(days=1), yesterday_str, 'past'),
+        (today, today_str, ''),
+    ):
+        label = 'yesterday' if date_str == yesterday_str else 'today'
+        print(f"\n  Fetching HKIA data for {date_str} ({label}) ...")
+        try:
+            raw = ff.fetch_date(date_obj, endpoint)
+        except Exception as e:
+            print(f"  ✗ Fetch failed (offline/API error): {e}")
+            return None
+
+        if not isinstance(raw, list) or not raw:
+            print(f"  ✗ No data returned for {date_str} (offline or API down).")
+            return None
+
+        # Parse this date's passenger arrivals/departures (same as fetch_flights.main)
+        arrivals_raw, departures_raw = [], []
+        for entry in raw:
+            if entry.get('cargo'):
+                continue
+            flights = entry.get('list', [])
+            if entry.get('arrival'):
+                for fl in flights:
+                    fl['_date'] = date_str
+                    fl['_type'] = 'arrival'
+                arrivals_raw.extend(flights)
+            else:
+                for fl in flights:
+                    fl['_date'] = date_str
+                    fl['_type'] = 'departure'
+                departures_raw.extend(flights)
+
+        # Format + enrich using the project's own helpers
+        formatted_arr = ff.format_arrivals(arrivals_raw)
+        formatted_dep = ff.format_departures(departures_raw)
+        for fl in formatted_arr:
+            md.enrich_flight(fl, airline_lookup)
+        for fl in formatted_dep:
+            md.enrich_flight(fl, airline_lookup)
+
+        # Replace records whose date == this date; preserve all other days
+        existing_arr = [r for r in existing_arr if r.get('date') != date_str]
+        existing_arr.extend(formatted_arr)
+        existing_dep = [r for r in existing_dep if r.get('date') != date_str]
+        existing_dep.extend(formatted_dep)
+
+        fresh_arr += len(formatted_arr)
+        fresh_dep += len(formatted_dep)
+        print(f"  ✓  {date_str}: {len(formatted_arr)} arrivals / {len(formatted_dep)} departures")
+
+    existing_arr.sort(key=lambda x: (x.get('date', ''), x.get('time', '')))
+    existing_dep.sort(key=lambda x: (x.get('date', ''), x.get('time', '')))
+
+    with open(arr_path, 'w', encoding='utf-8') as f:
+        json.dump(existing_arr, f, ensure_ascii=False, indent=2)
+    with open(dep_path, 'w', encoding='utf-8') as f:
+        json.dump(existing_dep, f, ensure_ascii=False, indent=2)
+
+    # Reload the in-memory DB so subsequent searches see fresh statuses
+    db.arrivals = existing_arr
+    db.departures = existing_dep
+
+    print(f"  ✓ Refreshed [{yesterday_str} / {today_str}]:"
+          f" {fresh_arr} arrivals / {fresh_dep} departures")
+    return (fresh_arr, fresh_dep)
+
+
 # ========== TUI 模式 ==========
+def _pick_stand_gate(r):
+    """Return a Stand/Gate display string for a flight record.
+    Arrivals -> parking_stand, departures -> gate. If both present
+    (and different) show 'stand/gate', otherwise prefer whichever is non-empty.
+    """
+    stand = (r.get('parking_stand') or '').strip()
+    gate = (r.get('gate') or '').strip()
+    if stand and gate and stand != gate:
+        return f"{stand}/{gate}"
+    return stand or gate or '-'
+
+
 def _print_results(db, results, title=""):
-    """Print flight results table with Reg column."""
+    """Print flight results table with Reg and Stand/Gate columns."""
     if title:
         print(f"\n  {title}")
-    print(f"  {'Type':5s} {'Flight':10s} {'Reg':8s} {'Date':12s} {'Time':6s} {'Route':20s} {'Status':20s}")
-    print("  " + "-" * 90)
+    print(f"  {'Type':5s} {'Flight':10s} {'Reg':8s} {'Date':12s} {'Time':6s} {'Route':20s} {'S/G':10s} {'Status':20s}")
+    print("  " + "-" * 100)
     for r in results:
         tp = 'ARR' if 'origin' in r else 'DEP'
         dest = r.get('destination', r.get('origin', ''))
         route = f"HKG→{dest}" if tp == 'DEP' else f"{dest}→HKG"
         reg = db.get_reg(r['flight_number'], r['date']) or '-'
-        print(f"  {tp:5s} {r['flight_number']:10s} {reg:8s} {r['date']:12s} {r['time']:6s} {route:20s} {r.get('status', ''):20s}")
+        sg = _pick_stand_gate(r)
+        print(f"  {tp:5s} {r['flight_number']:10s} {reg:8s} {r['date']:12s} {r['time']:6s} {route:20s} {sg:10s} {r.get('status', ''):20s}")
 
 
 def run_tui(data_dir='.'):
@@ -345,7 +475,8 @@ def run_tui(data_dir='.'):
         print("  2. Search by date")
         print("  3. Show airline info")
         print("  4. Start web server (browser)")
-        print("  0. Exit")
+        print("  0. 刷新航班数据 (Refresh data)")
+        print("  q. 退出 (Exit)")
         print("-" * 50)
 
         choice = input("  Choose: ").strip()
@@ -358,10 +489,14 @@ def run_tui(data_dir='.'):
 
             q_upper = query.upper()
 
-            # Check if it looks like a flight number (starts with letters)
-            is_flight = bool(re.match(r'^[A-Za-z]', q_upper))
+            # Classify input:
+            #   multi-letter prefix (CX759, NH 811) -> flight number search
+            #   single-letter prefix (N32, N 32, D201) -> Stand/Gate search
+            #   pure number (32)                    -> ask Stand/Gate or Flight
+            m = re.match(r'^([A-Za-z]+)[ \t]*(\d+)', q_upper)
+            letters = m.group(1) if m else ''
 
-            if is_flight:
+            if letters and len(letters) >= 2:
                 # It's a flight number - ask codeshare
                 cs = input("  Include codeshare? (y/n) [n]: ").strip().lower()
                 codeshare = cs in ('y', 'yes')
@@ -369,8 +504,13 @@ def run_tui(data_dir='.'):
                 results.sort(key=lambda x: (x.get('date', ''), x.get('time', '')))
                 cs_label = "codeshare" if codeshare else "operator only"
                 _print_results(db, results, f"Flights containing '{query}' ({cs_label}, 12h~+2h):")
+            elif letters and len(letters) == 1:
+                # Single-letter stand/gate prefix (e.g. N32) - search stands/gates directly
+                results = db.search_by_stand_or_gate(q_upper)
+                results.sort(key=lambda x: (x.get('date', ''), x.get('time', '')))
+                _print_results(db, results, f"Stand/Gate '{query}' flights (12h~+2h):")
             else:
-                # Could be stand/gate or flight number - ask
+                # Pure number - could be stand/gate or flight number - ask
                 print(f"\n  '{query}' - Search as:")
                 print("  1. Stand / Gate")
                 print("  2. Flight number")
@@ -427,6 +567,15 @@ def run_tui(data_dir='.'):
             run_web_server(data_dir, int(port))
 
         elif choice == '0':
+            result = run_refresh(db, data_dir)
+            if result is None:
+                print("  刷新失败：请检查网络或稍后再试。")
+            else:
+                stats = db.stats()
+                print(f"  数据库已加载 {stats['total_arrivals']} 到达 / {stats['total_departures']} 出发。")
+            input("\n  Press Enter...")
+
+        elif choice in ('q', 'Q'):
             break
 
 
