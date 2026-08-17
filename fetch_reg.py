@@ -75,6 +75,27 @@ def extract_flight_info(flight_number):
     return None, None
 
 
+def lookup_reg(carrier, num, date):
+    """Look up cached reg for a flight. Returns dict or None."""
+    cached = load_cache(carrier, num, date)
+    if cached:
+        return cached
+    # Try fetching if not cached
+    year, month, day = date.split('-')
+    result = fetch_flight_stats(carrier, num, year, month, int(day))
+    if 'error' not in result and result.get('tailNumber'):
+        save_cache(carrier, num, date, result)
+    return result
+
+
+def lookup_by_flight(flight_number, date):
+    """Look up reg by flight number string like 'CX 759' or 'MU725'"""
+    carrier, num = extract_flight_info(flight_number)
+    if not carrier or not num:
+        return None
+    return lookup_reg(carrier, num, date)
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser()
