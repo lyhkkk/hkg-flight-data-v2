@@ -62,6 +62,14 @@ class FlightDB:
         """获取航空公司信息"""
         return self.airlines.get(code, {})
 
+    def airline_display(self, code):
+        """返回组合航司代码，如 CPA/CX"""
+        info = self.airlines.get(code, {})
+        iata = info.get('iata_code', '')
+        if iata and iata != code:
+            return f"{code}/{iata}"
+        return code
+
     def stats(self):
         """统计信息"""
         dates = set(f.get('date') for f in self.arrivals)
@@ -236,7 +244,8 @@ def run_tui(data_dir='.'):
                 results = db.search_flight(fn)
                 if results:
                     for r in results:
-                        print(f"\n  {r['flight_number']} | {r['date']} {r['time']}")
+                        airline_disp = db.airline_display(r.get('airline_code', ''))
+                        print(f"\n  {r['flight_number']} ({airline_disp}) | {r['date']} {r['time']}")
                         tp = '→' if 'destination' in r else '←'
                         dest = r.get('destination', r.get('origin', ''))
                         print(f"  Route: HKG {tp} {dest}")

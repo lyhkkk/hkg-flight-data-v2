@@ -73,6 +73,27 @@ def fetch_airlines():
         return data
     return []
 
+def airline_display(code):
+    """返回组合航司代码，如 CPA/CX"""
+    if not code:
+        return ''
+    # Try local airlines info file first (has both ICAO and IATA codes)
+    try:
+        import inspect
+        caller_dir = os.path.dirname(os.path.abspath(inspect.stack()[0].filename))
+        air_path = os.path.join(caller_dir, 'hkg_airlines_info.json')
+        if os.path.exists(air_path):
+            with open(air_path, 'r', encoding='utf-8') as f:
+                for a in json.load(f):
+                    if a.get('airline_code') == code:
+                        iata = a.get('iata_code', '')
+                        if iata and iata != code:
+                            return f"{code}/{iata}"
+                        return code
+    except Exception:
+        pass
+    return code
+
 def parse_flights(raw_data):
     """解析 API 数据"""
     arrivals = []
@@ -98,6 +119,7 @@ def parse_flights(raw_data):
                 'hall': flight.get('hall', ''),
                 'belt': flight.get('baggage', '') or flight.get('belt', ''),
                 'parking_stand': flight.get('stand', ''),
+                'airline_display': airline_display(flight.get('flight', [{}])[0].get('airline', '') if flight.get('flight') else ''),
             }
 
             if entry.get('arrival'):
@@ -278,7 +300,7 @@ def run_cli():
             tp = '->' if f.get('type') == 'departure' else '<-'
             dest = f.get('destination', f.get('origin', ''))
             print(f"\n{'='*40}")
-            print(f"  {f['flight_number']}  |  {f['type'].upper()}")
+            print(f"  {f['flight_number']} ({f.get('airline_display', f.get('airline_code', ''))})  |  {f['type'].upper()}")
             print(f"  Route:  HKG {tp} {dest}")
             print(f"  Date:   {f['date']}  {f['time']}")
             print(f"  Status: {f.get('status', 'Scheduled')}")
