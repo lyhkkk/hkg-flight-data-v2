@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Data cache
+.hkg_cache/
+
+# Generated data (too large for git)
+*.json
+*.csv
+
+# Keep scripts and docs
+!docs/*.md
+!examples/*.html
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
