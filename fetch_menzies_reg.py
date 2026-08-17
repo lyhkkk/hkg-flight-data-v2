@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """
-Fetch aircraft registration from Menzies LSD API (free, no auth)
-https://fvm.menziescnac.com/flights
+Fetch aircraft registration from Menzies LSD API
+Set MENZIES_LSD_URL env var before using.
 """
 import json
 import os
 import time
 import urllib.request
 
-API_URL = "https://fvm.menziescnac.com/flights"
+# API URL loaded from .env or env var to avoid exposing in repo
+API_URL = os.environ.get('MENZIES_LSD_URL', '')
 CACHE_DIR = os.path.expanduser("~/.hkg_cache/menzies")
 CACHE_EXPIRY = 300  # 5 minutes (real-time data)
 
 
 def fetch_lsd():
     """Fetch Landing Status Data from Menzies"""
+    if not API_URL:
+        print("Error: Set MENZIES_LSD_URL environment variable")
+        return []
     os.makedirs(CACHE_DIR, exist_ok=True)
     cache_file = os.path.join(CACHE_DIR, "lsd.json")
 
