@@ -8,7 +8,12 @@ import json
 import os
 import re
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+
+# Statuses that mean a flight's record is final and no longer needs straggler re-fetching.
+# Matched case-insensitively, including partial forms like "At gate 22:05", "Dep 21:24".
+FINAL_STATUSES = {'at gate', 'departed', 'cancelled'}
 
 
 # ========== 数据库 ==========
@@ -313,15 +318,21 @@ async function search(){{
 
 # ========== 手动刷新航班数据 ==========
 def run_refresh(db, data_dir='.'):
-    """Fetch flight data for yesterday & today from HKIA and refresh the in-memory FlightDB.
+    """Fetch flight data with a three-layer refresh strategy and update the in-memory FlightDB.
 
-    Reuses the project's own fetch/format/merge helpers in scripts/.
-    Refetches BOTH yesterday and today so that flights still inside the
-    12h-before ~ +2h-after search window (e.g. yesterday's flights after
-    midnight) get their statuses updated too.  Merges in place for those
-    two dates only; all other days are preserved.  Yesterday uses the
-    'flights/past' endpoint, today uses the regular 'flights' endpoint.
-    Returns (arrivals_count, departures_count) or None on failure.
+    Layers:
+      1. 36h rolling window: dates from (now - 12h) to (now + 24h), inclusive.
+      2. Straggler catch-up: any existing flight scheduled >12h before now with a
+         non-final status causes its date to be re-fetched.
+      3. Daily 0400 first-refresh: after 04:00 HKT, if today's flag file is absent,
+         also re-fetch today-2 and today-1, then write the flag on success.
+
+    Past dates use the 'flights/past' endpoint; today/future use the regular
+    'flights' endpoint. Reuses the project's own fetch/format/merge helpers in
+    scripts/. Each date is merged in place: only records whose date matches that
+    date are replaced; all other days are preserved. One failing date does not
+    abort the other dates.
+    Returns (arrivals_count, departures_count) or None if every date failed.
     """
     import sys
 
@@ -354,27 +365,76 @@ def run_refresh(db, data_dir='.'):
         with open(dep_path, 'r', encoding='utf-8') as f:
             existing_dep = json.load(f)
 
-    today = datetime.now().date()
+    HKT = timezone(timedelta(hours=8))
+    now_hkt = datetime.now(HKT)
+    today = now_hkt.date()
     today_str = today.strftime('%Y-%m-%d')
-    yesterday_str = (today - timedelta(days=1)).strftime('%Y-%m-%d')
+
+    # ---- Layer 1: 36h rolling window (now - 12h .. now + 24h, dates inclusive) ----
+    dates = set()
+    cur = (now_hkt - timedelta(hours=12)).date()
+    end_date = (now_hkt + timedelta(hours=24)).date()
+    while cur <= end_date:
+        dates.add(cur)
+        cur += timedelta(days=1)
+
+    # ---- Layer 2: straggler catch-up (runs every refresh, independent of 0400) ----
+    def _is_finalized(flight):
+        status_lower = (flight.get('status') or '').strip().lower()
+        # "dep ..." is HKIA's abbreviation for "departed" and is also final.
+        if status_lower in FINAL_STATUSES or status_lower == 'dep':
+            return True
+        if status_lower.startswith('dep '):
+            return True
+        return any(status_lower.startswith(s + ' ') for s in FINAL_STATUSES)
+
+    straggler_dates = set()
+    cutoff = now_hkt - timedelta(hours=12)
+    for flight in existing_arr + existing_dep:
+        date_str = flight.get('date')
+        time_str = flight.get('time')
+        if not date_str or not time_str:
+            continue
+        try:
+            scheduled = datetime.strptime(f"{date_str} {time_str}", '%Y-%m-%d %H:%M')
+            scheduled = scheduled.replace(tzinfo=HKT)
+        except Exception:
+            continue
+        if scheduled < cutoff and not _is_finalized(flight):
+            straggler_dates.add(scheduled.date())
+    dates.update(straggler_dates)
+
+    # ---- Layer 3: daily 0400 first-refresh ----
+    flag_dir = os.path.expanduser('~/.hkg_cache')
+    flag_path = os.path.join(flag_dir, f'.0400_refresh_{today_str}')
+    flag_exists = os.path.exists(flag_path)
+    refresh_0400 = now_hkt.hour >= 4 and not flag_exists
+    refresh_0400_dates = set()
+    if refresh_0400:
+        refresh_0400_dates = {today - timedelta(days=1), today - timedelta(days=2)}
+        dates.update(refresh_0400_dates)
+
+    # De-duplicate and sort all collected dates before fetching.
+    dates = sorted(dates)
+    print(f"  Refresh date set ({len(dates)} date(s)): {', '.join(d.strftime('%Y-%m-%d') for d in dates)}")
 
     fresh_arr, fresh_dep = 0, 0
-    # Yesterday -> 'flights/past' endpoint, today -> regular 'flights' endpoint
-    for date_obj, date_str, endpoint in (
-        (today - timedelta(days=1), yesterday_str, 'past'),
-        (today, today_str, ''),
-    ):
-        label = 'yesterday' if date_str == yesterday_str else 'today'
+    fetched_dates = []
+    for date_obj in dates:
+        date_str = date_obj.strftime('%Y-%m-%d')
+        # Past dates -> 'flights/past' endpoint; today/future -> regular 'flights'
+        endpoint = 'past' if date_obj < today else ''
+        label = 'past' if endpoint else ('today' if date_obj == today else 'future')
         print(f"\n  Fetching HKIA data for {date_str} ({label}) ...")
         try:
             raw = ff.fetch_date(date_obj, endpoint)
         except Exception as e:
             print(f"  ✗ Fetch failed (offline/API error): {e}")
-            return None
+            continue
 
         if not isinstance(raw, list) or not raw:
             print(f"  ✗ No data returned for {date_str} (offline or API down).")
-            return None
+            continue
 
         # Parse this date's passenger arrivals/departures (same as fetch_flights.main)
         arrivals_raw, departures_raw = [], []
@@ -409,7 +469,13 @@ def run_refresh(db, data_dir='.'):
 
         fresh_arr += len(formatted_arr)
         fresh_dep += len(formatted_dep)
+        fetched_dates.append(date_str)
         print(f"  ✓  {date_str}: {len(formatted_arr)} arrivals / {len(formatted_dep)} departures")
+
+    if not fetched_dates:
+        print(f"  ✓ Straggler catch-up: {len(straggler_dates)} stale date(s) found")
+        print("  ✗ No dates could be refreshed (offline or API down).")
+        return None
 
     existing_arr.sort(key=lambda x: (x.get('date', ''), x.get('time', '')))
     existing_dep.sort(key=lambda x: (x.get('date', ''), x.get('time', '')))
@@ -419,12 +485,37 @@ def run_refresh(db, data_dir='.'):
     with open(dep_path, 'w', encoding='utf-8') as f:
         json.dump(existing_dep, f, ensure_ascii=False, indent=2)
 
+    # ---- Layer 3 flag: mark done only when both 0400 dates were successfully fetched ----
+    flag_written = False
+    if refresh_0400:
+        refresh_0400_strs = {d.strftime('%Y-%m-%d') for d in refresh_0400_dates}
+        if refresh_0400_strs and refresh_0400_strs.issubset(set(fetched_dates)):
+            try:
+                os.makedirs(flag_dir, exist_ok=True)
+                with open(flag_path, 'w', encoding='utf-8') as f:
+                    f.write(now_hkt.isoformat())
+                flag_written = True
+            except Exception as e:
+                print(f"  ✗ Could not write 0400 flag: {e}")
+
     # Reload the in-memory DB so subsequent searches see fresh statuses
     db.arrivals = existing_arr
     db.departures = existing_dep
 
-    print(f"  ✓ Refreshed [{yesterday_str} / {today_str}]:"
-          f" {fresh_arr} arrivals / {fresh_dep} departures")
+    print(f"  ✓ Refreshed {len(fetched_dates)} date(s): {', '.join(fetched_dates)}")
+    for date_str in fetched_dates:
+        arr_count = sum(1 for r in existing_arr if r.get('date') == date_str)
+        dep_count = sum(1 for r in existing_dep if r.get('date') == date_str)
+        print(f"    {date_str}: {arr_count} arrivals / {dep_count} departures")
+    print(f"  ✓ Total fresh: {fresh_arr} arrivals / {fresh_dep} departures")
+    print(f"  ✓ Straggler catch-up: {len(straggler_dates)} stale date(s): {', '.join(d.strftime('%Y-%m-%d') for d in sorted(straggler_dates)) or '-'}")
+    if refresh_0400:
+        if flag_written:
+            print(f"  ✓ 0400 first-refresh: done ({', '.join(d.strftime('%Y-%m-%d') for d in sorted(refresh_0400_dates))}); flag written: {flag_path}")
+        else:
+            print(f"  ✓ 0400 first-refresh: requested ({', '.join(d.strftime('%Y-%m-%d') for d in sorted(refresh_0400_dates))}) but not all dates succeeded; flag NOT written")
+    else:
+        print("  ✓ 0400 first-refresh: skipped (before 04:00 HKT or flag already exists)")
     return (fresh_arr, fresh_dep)
 
 
